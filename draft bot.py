@@ -167,33 +167,6 @@ class ManualStartView(discord.ui.View):
         await auto_start_draft(interaction.guild, interaction.channel)
 
 
-class SubmitCashTag(Modal, title="Submit Your Cash App Tag"):
-    def __init__(self, user_id: int, channel_id: int):
-        super().__init__()
-        self.user_id = user_id
-        self.channel_id = channel_id
-
-        self.cash_tag_input = TextInput(
-            label="Enter your exact $CashTag (without the $)",
-            placeholder="e.g. john123",
-            style=TextStyle.short,
-            required=True
-        )
-        self.add_item(self.cash_tag_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        submitted_tag = self.cash_tag_input.value.strip()
-
-        data = load_drafts()
-        draft = data.get(str(self.channel_id))
-        if draft:
-            if "cash_tags" not in draft:
-                draft["cash_tags"] = {}
-            draft["cash_tags"][str(self.user_id)] = submitted_tag
-            save_drafts(data)
-
-        await interaction.response.send_message("✅ Your Cash App tag was submitted!", ephemeral=True)
-
 class MiddleManForm(discord.ui.Modal, title="Middle Man Setup"):
     cashapp = discord.ui.TextInput(label="Enter your Cash App tag", placeholder="$yourtag", required=True)
 
@@ -218,17 +191,22 @@ class MiddleManForm(discord.ui.Modal, title="Middle Man Setup"):
         await begin_cashapp_collection(interaction.guild, interaction.channel)
 
 class MiddleManButton(discord.ui.View):
-    def __init__(self, channel_id, role_id):
+    def __init__(self, channel_id):
         super().__init__(timeout=None)
         self.channel_id = channel_id
-        self.role_id = role_id
 
     @discord.ui.button(label="I'm the Middle Man", style=discord.ButtonStyle.primary)
     async def confirm_mm(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Optional: permission check
-        if not await has_role(interaction.user, ["Middleman", "Draft Admin"]):
+        if MIDDLEMAN_ROLE_ID not in [role.id for role in interaction.user.roles]:
             await interaction.response.send_message("You don't have permission to be the Middle Man.", ephemeral=True)
             return
+
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if draft is not None:
+            draft["middleman_id"] = interaction.user.id
+            save_drafts(data)
 
         # ✅ Send the modal to collect the Cash App tag
         await interaction.response.send_modal(MiddlemanCashTagModal(self.channel_id))
@@ -240,19 +218,9 @@ class CashAppSubmitView(discord.ui.View):
         super().__init__(timeout=None)
         self.channel_id = channel_id
 
-@discord.ui.button(label="Submit Cash App Tag", style=discord.ButtonStyle.green)
-async def submit_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
-    await interaction.response.send_modal(
-        SubmitCashTag(user_id=interaction.user.id, channel_id=self.channel_id)
-    )
-
-    # Store player cash tags for this draft channel
-    draft = load_drafts().get(str(self.channel_id))
-    if draft:
-        pending_payments[str(self.channel_id)] = {
-            tag: int(uid) for uid, tag in draft.get("cash_tags", {}).items()
-        }
-        confirmed_payments[str(self.channel_id)] = set()
+    @discord.ui.button(label="Submit Cash App Tag", style=discord.ButtonStyle.green)
+    async def submit_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PlayerCashTagForm(self.channel_id))
 
 
 
@@ -283,10 +251,16 @@ class PlayerCashTagForm(discord.ui.Modal, title="Enter Your Cash App Tag"):
         # ⬇️ MOVE THE CHECK HERE — inside the async function
         if draft:
             if len(draft.get("player_tags", {})) == len(draft.get("players", [])):
+                pending_payments[str(self.channel_id)] = {
+                    tag: int(uid) for uid, tag in draft.get("player_tags", {}).items()
+                }
+                confirmed_payments[str(self.channel_id)] = set()
                 # All players submitted — show middleman's Cash App
                 await send_payment_instructions(channel)
             else:
-                print(f"{len(draft['player_tags'])}/{len(draft['players'])} Cash Tags submitted")
+                print(
+                    f"{len(draft['player_tags'])}/{len(draft['players'])} Cash Tags submitted"
+                )
 
 
 
@@ -297,12 +271,13 @@ class PaymentControlView(discord.ui.View):
 
     @discord.ui.button(label="Start Draft Manually", style=discord.ButtonStyle.red)
     async def manual_start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await has_role(interaction.user, ["Draft Admin", "Middleman"]):
+        allowed = any(r.id == MIDDLEMAN_ROLE_ID or r.name == "Draft Admin" for r in interaction.user.roles)
+        if not allowed:
             await interaction.response.send_message("You don’t have permission to start the draft.", ephemeral=True)
             return
 
         await interaction.response.send_message("✅ Starting draft manually...", ephemeral=True)
-        await auto_start_draft(interaction.channel)
+        await auto_start_draft(interaction.guild, interaction.channel)
 
 
 
@@ -348,37 +323,24 @@ async def begin_cashapp_collection(guild, channel):
     if not draft:
         return
 
+    middleman = f"<@{draft.get('middleman_id')}>" if draft.get('middleman_id') else "Middleman"
+    player_mentions = " ".join(f"<@{uid}>" for uid in draft.get("players", []))
+
     embed = discord.Embed(
-        title="💵 Submit Your Cash App Tag",
+        title="💵 CashTag Collection",
         description=(
-            "Click the button below to submit your Cash App tag. "
-            "Once everyone sends payment, the draft will start automatically.\n\n"
-            "If someone doesn’t send their payment, the **middleman** can manually start the draft."
+            f"{middleman} will hold the pot.\n"
+            f"{player_mentions}\n"
+            "Click the button below to submit your Cash App tag."
         ),
-        color=discord.Color.green()
+        color=discord.Color.green(),
     )
-    
+
     view = CashAppSubmitView(channel_id=channel.id)
     manual_view = ManualStartView(channel_id=channel.id)
 
     await channel.send(embed=embed, view=view)
     await channel.send(view=manual_view)
-
-    for uid in draft["players"]:
-        member = guild.get_member(uid)
-        if member:
-            try:
-                view = discord.ui.View()
-                button = discord.ui.Button(label="Submit Cash App Tag", style=discord.ButtonStyle.primary)
-
-                async def callback(interaction: discord.Interaction, user_id=uid, channel_id=channel.id):
-                    await interaction.response.send_modal(PlayerCashTagForm(user_id, channel_id))
-
-                button.callback = callback
-                view.add_item(button)
-                await member.send("Please submit your Cash App tag:", view=view)
-            except:
-                print(f"Could not DM user {uid}")
 
 async def send_middleman_selection(channel):
     data = load_drafts()
@@ -386,16 +348,12 @@ async def send_middleman_selection(channel):
     if not draft:
         return
 
-    role_id = draft.get("middleman_role_id")
-    if not role_id:
-        return
-
     embed = discord.Embed(
-        title="✅ Middle Man Selected: <#{}>".format(channel.id),
+        title="⏳ Waiting for Middle Man",
         description="Click the button below if you're the Middleman.\nYou'll be prompted to enter your Cash App tag.",
         color=discord.Color.orange()
     )
-    view = MiddleManButton(channel.id, role_id)
+    view = MiddleManButton(channel.id)
     await channel.send(embed=embed, view=view)
 
 
@@ -406,12 +364,17 @@ async def send_payment_instructions(channel):
         return
 
     entry = draft.get("entry_amount", 0)
-    middleman_tag = draft.get("middleman_cashapp", "$unknown")
+    middleman_tag = draft.get("middleman_cash_tag", "$unknown")
     total = entry * len(draft["players"])
+
+    pending_payments[str(channel.id)] = {
+        tag: int(uid) for uid, tag in draft.get("player_tags", {}).items()
+    }
+    confirmed_payments[str(channel.id)] = set()
 
     embed = discord.Embed(
         title="💰 Payment Instructions",
-        description=f"Please send your entry fee to the middleman before the match begins.",
+        description="Send your entry fee to the middleman now.",
         color=discord.Color.gold()
     )
     embed.add_field(name="📲 Middleman's Cash App", value=middleman_tag, inline=False)
@@ -419,9 +382,11 @@ async def send_payment_instructions(channel):
     embed.add_field(name="📦 Total Expected", value=f"${total} total from {len(draft['players'])} players", inline=False)
     embed.set_footer(text="Once all payments are confirmed, the draft will begin.")
 
+    player_mentions = " ".join(f"<@{uid}>" for uid in draft.get("players", []))
+
     # Manual Start Button
     view = PaymentControlView(channel.id)
-    await channel.send(embed=embed, view=view)
+    await channel.send(content=player_mentions, embed=embed, view=view)
 
 
 async def send_pick_options(channel):
@@ -468,55 +433,6 @@ class GoToDraftButton(discord.ui.View):
 
 
 
-class MiddleManButton(discord.ui.View):
-    def __init__(self, channel_id, role_id):
-        super().__init__(timeout=None)
-        self.channel_id = str(channel_id)
-        self.role_id = role_id
-        self.middleman = None
-
-    @discord.ui.button(label="✅ I'm the Middle Man", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.role_id not in [role.id for role in interaction.user.roles]:
-            await interaction.response.send_message("❌ Only a Middle Man can click this.", ephemeral=True)
-            return
-
-        self.middleman = interaction.user
-        await interaction.channel.set_permissions(self.middleman, send_messages=True)
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content=f"✅ Middle Man Selected: {interaction.user.mention}", view=self)
-        await interaction.response.send_message("Thank you! Now send proof of payments.", ephemeral=True)
-
-        # Proceed with the draft start here
-        await send_payment_confirmation(interaction.channel, interaction.user)
-
-async def send_payment_confirmation(channel, middleman):
-    embed = discord.Embed(
-        title="💸 Send Payments",
-        description=f"All participants must now send their payments to {middleman.mention}.\n\nOnce all payments are confirmed, the Middle Man should confirm below.",
-        color=discord.Color.gold()
-    )
-    view = ConfirmPaymentButton(middleman.id)
-    await channel.send(embed=embed, view=view)
-
-
-class ConfirmPaymentButton(discord.ui.View):
-    def __init__(self, middleman_id):
-        super().__init__(timeout=None)
-        self.middleman_id = middleman_id
-
-    @discord.ui.button(label="✅ Confirm All Payments Received", style=discord.ButtonStyle.primary)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.middleman_id:
-            await interaction.response.send_message("❌ Only the selected Middle Man can confirm this.", ephemeral=True)
-            return
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content="✅ All payments received. Starting draft...", view=self)
-        await send_actual_draft_start(interaction.channel)
-        await send_pick_options(interaction.channel)
 
     
 class DraftQueueView(discord.ui.View):
@@ -622,41 +538,19 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
             f"✅ Your Cash App tag `{submitted_tag}` has been saved.", ephemeral=True
         )
 
-        # 🔔 Notify the channel
         channel = interaction.guild.get_channel(self.channel_id)
-        if not channel:
-            return
-
-        amount = draft.get("entry_amount", 0)
-        cash_tag_display = f"${submitted_tag}"
-
-        embed = discord.Embed(
-            title="💵 Payment Phase",
-            description=(
-                f"Please send **${amount}** to the middleman at `{cash_tag_display}`.\n\n"
-                "Each player must submit payment to continue."
-            ),
-            color=discord.Color.gold()
-        )
-        embed.set_footer(text="Use Cash App and make sure to send the correct amount.")
-
-        view = ManualStartView(channel_id=self.channel_id)
-        await channel.send(embed=embed, view=view)
+        if channel:
+            await begin_cashapp_collection(interaction.guild, channel)
 
 
 
 
 @tree.command(name="createdraft", description="Create a new draft")
 @app_commands.describe(
-    draft_type="Is this a friendly or wager draft?",
-    entry_amount="Amount each player pays (only for wager drafts)",
     team_size="Choose 3v3 or 4v4",
+    is_money_draft="Require Cash App payment?",
     snake_draft="Enable snake draft"
 )
-@app_commands.choices(draft_type=[
-    app_commands.Choice(name="Friendly", value="friendly"),
-    app_commands.Choice(name="Wager", value="wager")
-])
 @app_commands.choices(team_size=[
     app_commands.Choice(name="3v3", value="3v3"),
     app_commands.Choice(name="4v4", value="4v4"),
@@ -666,8 +560,7 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
 async def createdraft(
     interaction: discord.Interaction,
     team_size: app_commands.Choice[str],
-    draft_type: app_commands.Choice[str],
-    entry_amount: int = 0,
+    is_money_draft: bool = False,
     snake_draft: bool = True,
 ):
     team_count = int(team_size.name[0])
@@ -676,13 +569,10 @@ async def createdraft(
     now = int(datetime.datetime.now().timestamp())      # For Discord timestamp formatting
     now = int(datetime.datetime.now().timestamp())
 
-    # Save wager/friendly type and entry amount
-# Save wager/friendly type and entry amount
     draft_data = {
         "team_size": team_size.value,
         "snake_draft": snake_draft,
-        "draft_type": draft_type.value,
-        "entry_amount": entry_amount if draft_type.value == "wager" else 0,
+        "is_money_draft": is_money_draft,
         "date": now,
         "players": [],
         "team1": [],
@@ -692,7 +582,7 @@ async def createdraft(
         "team_roles": {},
         "available": [],
         "pick_turn": "team1"
-}
+    }
 
 
 
@@ -1025,12 +915,12 @@ async def auto_start_draft(guild, channel):
     c2 = await guild.fetch_member(captains[1])
     snake = draft["snake_draft"]
 
-    if draft.get("draft_type") == "friendly":
+    if not draft.get("is_money_draft"):
         await send_actual_draft_start(channel)
         await assign_team_roles(guild, channel, draft)
         await send_pick_options(channel)
         await dm_players_draft_started(channel)
-    elif draft.get("draft_type") == "wager":
+    else:
         await send_middleman_selection(channel)
 
 
