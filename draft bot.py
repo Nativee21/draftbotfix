@@ -5,15 +5,21 @@ from dotenv import load_dotenv
 import json
 import os
 import datetime
+from pathlib import Path
 import random
+import string
 import asyncio
 from discord.ui import Modal, TextInput
 from discord import TextStyle
+import re
 
 
 load_dotenv()
 EMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+# Read the bot token from the environment so it isn't hard-coded
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "PASTE_YOUR_BOT_TOKEN_HERE"
+# If you prefer not to use an environment variable, fill in your token above
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -25,7 +31,8 @@ DRAFTS_FILE = "drafts.json"
 
 # Track pending payments
 pending_payments = {}  # channel_id: {cash_tag: user_id}
-confirmed_payments = {}  # channel_id: set(user_ids)
+# Track how much each user has paid
+payments_received = {}  # channel_id: {user_id: float}
 
 
 if not os.path.exists(DRAFTS_FILE):
@@ -115,6 +122,35 @@ def disable_all_buttons(view: discord.ui.View):
             item.disabled = True
 
 
+def team_role_mentions(guild, draft) -> str:
+    """Return mention string for both team roles."""
+    mentions = []
+    for rid in draft.get("team_roles", {}).values():
+        role = guild.get_role(rid)
+        if role:
+            mentions.append(role.mention)
+    return " ".join(mentions)
+
+
+async def disable_queue_buttons(channel):
+    """Disable join/leave buttons once the draft starts."""
+    data = load_drafts()
+    draft = data.get(str(channel.id))
+    if not draft:
+        return
+    message_id = draft.get("queue_message_id")
+    if not message_id:
+        return
+    try:
+        msg = await channel.fetch_message(message_id)
+        team_count = int(draft["team_size"][0])
+        view = DraftQueueView(channel.id, team_count * 2)
+        disable_all_buttons(view)
+        await msg.edit(view=view)
+    except Exception as e:
+        print(f"Error disabling queue buttons: {e}")
+
+
 def generate_final_teams_embed(draft):
     embed = discord.Embed(
         title="📋 Final Teams",
@@ -164,38 +200,11 @@ class ManualStartView(discord.ui.View):
             return
 
         await interaction.response.send_message("⏩ Manually starting the draft...", ephemeral=True)
-        await auto_start_draft(interaction.guild, interaction.channel)
+        await auto_start_draft(interaction.guild, interaction.channel, skip_middleman=True)
 
-
-class SubmitCashTag(Modal, title="Submit Your Cash App Tag"):
-    def __init__(self, user_id: int, channel_id: int):
-        super().__init__()
-        self.user_id = user_id
-        self.channel_id = channel_id
-
-        self.cash_tag_input = TextInput(
-            label="Enter your exact $CashTag (without the $)",
-            placeholder="e.g. john123",
-            style=TextStyle.short,
-            required=True
-        )
-        self.add_item(self.cash_tag_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        submitted_tag = self.cash_tag_input.value.strip()
-
-        data = load_drafts()
-        draft = data.get(str(self.channel_id))
-        if draft:
-            if "cash_tags" not in draft:
-                draft["cash_tags"] = {}
-            draft["cash_tags"][str(self.user_id)] = submitted_tag
-            save_drafts(data)
-
-        await interaction.response.send_message("✅ Your Cash App tag was submitted!", ephemeral=True)
 
 class MiddleManForm(discord.ui.Modal, title="Middle Man Setup"):
-    cashapp = discord.ui.TextInput(label="Enter your Cash App tag", placeholder="$yourtag", required=True)
+    cashapp = discord.ui.TextInput(label="Enter your Cash App username", placeholder="e.g. johndoe", required=True)
 
     def __init__(self, channel_id):
         super().__init__()
@@ -218,19 +227,24 @@ class MiddleManForm(discord.ui.Modal, title="Middle Man Setup"):
         await begin_cashapp_collection(interaction.guild, interaction.channel)
 
 class MiddleManButton(discord.ui.View):
-    def __init__(self, channel_id, role_id):
+    def __init__(self, channel_id):
         super().__init__(timeout=None)
         self.channel_id = channel_id
-        self.role_id = role_id
 
     @discord.ui.button(label="I'm the Middle Man", style=discord.ButtonStyle.primary)
     async def confirm_mm(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Optional: permission check
-        if not await has_role(interaction.user, ["Middleman", "Draft Admin"]):
+        if MIDDLEMAN_ROLE_ID not in [role.id for role in interaction.user.roles]:
             await interaction.response.send_message("You don't have permission to be the Middle Man.", ephemeral=True)
             return
 
-        # ✅ Send the modal to collect the Cash App tag
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if draft is not None:
+            draft["middleman_id"] = interaction.user.id
+            save_drafts(data)
+
+        # ✅ Send the modal to collect the Cash App username
         await interaction.response.send_modal(MiddlemanCashTagModal(self.channel_id))
 
 
@@ -240,28 +254,40 @@ class CashAppSubmitView(discord.ui.View):
         super().__init__(timeout=None)
         self.channel_id = channel_id
 
-@discord.ui.button(label="Submit Cash App Tag", style=discord.ButtonStyle.green)
-async def submit_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
-    await interaction.response.send_modal(
-        SubmitCashTag(user_id=interaction.user.id, channel_id=self.channel_id)
-    )
+    @discord.ui.button(label="Submit Cash App Username", style=discord.ButtonStyle.green)
+    async def submit_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if not draft:
+            await interaction.response.send_message("Draft not found.", ephemeral=True)
+            return
 
-    # Store player cash tags for this draft channel
-    draft = load_drafts().get(str(self.channel_id))
-    if draft:
-        pending_payments[str(self.channel_id)] = {
-            tag: int(uid) for uid, tag in draft.get("cash_tags", {}).items()
-        }
-        confirmed_payments[str(self.channel_id)] = set()
+        if interaction.user.id not in draft.get("players", []):
+            await interaction.response.send_message(
+                "❌ Only players in the draft queue can submit a Cash App username.",
+                ephemeral=True,
+            )
+            return
+
+        already = draft.get("player_tags", {}).get(str(interaction.user.id))
+        if already:
+            await interaction.response.send_message("You've already submitted your username.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(PlayerCashTagForm(self.channel_id))
 
 
 
 
-class PlayerCashTagForm(discord.ui.Modal, title="Enter Your Cash App Tag"):
+class PlayerCashTagForm(discord.ui.Modal, title="Enter Your Cash App Username"):
     def __init__(self, channel_id):
         super().__init__()
         self.channel_id = channel_id
-        self.cashapp = discord.ui.TextInput(label="Cash App Tag", placeholder="$example", required=True)
+        self.cashapp = discord.ui.TextInput(
+            label="**Cash App USERNAME** (not $tag)",
+            placeholder="e.g. johndoe",
+            required=True,
+        )
         self.add_item(self.cashapp)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -271,38 +297,502 @@ class PlayerCashTagForm(discord.ui.Modal, title="Enter Your Cash App Tag"):
         if "player_tags" not in draft:
             draft["player_tags"] = {}
 
-        draft["player_tags"][str(interaction.user.id)] = self.cashapp.value
+        if interaction.user.id not in draft.get("players", []):
+            await interaction.response.send_message(
+                "❌ You are not in this draft's queue.", ephemeral=True
+            )
+            return
+
+        tag = self.cashapp.value.strip().lower()
+        existing = [t.lower() for t in draft.get("player_tags", {}).values()]
+        if tag in existing:
+            await interaction.response.send_message(
+                "❌ That Cash App username is already used by another player.",
+                ephemeral=True,
+            )
+            return
+        if len(tag) <= 3:
+            await interaction.response.send_message(
+                "❌ Cash App username must be longer than 3 characters.", ephemeral=True
+            )
+            return
+
+        if str(interaction.user.id) in draft["player_tags"]:
+            await interaction.response.send_message(
+                "You already submitted your Cash App username.", ephemeral=True
+            )
+            return
+
+        draft["player_tags"][str(interaction.user.id)] = tag
         save_drafts(data)
 
-        await interaction.response.send_message("✅ Cash App tag submitted!", ephemeral=True)
+        await interaction.response.send_message("✅ Cash App username submitted!", ephemeral=True)
 
         channel = interaction.client.get_channel(self.channel_id)
         if channel:
-            await channel.send(f"📝 {interaction.user.mention} has submitted their Cash App tag.")
+            await channel.send(f"📝 {interaction.user.mention} has submitted their Cash App username.")
 
-        # ⬇️ MOVE THE CHECK HERE — inside the async function
         if draft:
             if len(draft.get("player_tags", {})) == len(draft.get("players", [])):
-                # All players submitted — show middleman's Cash App
                 await send_payment_instructions(channel)
             else:
-                print(f"{len(draft['player_tags'])}/{len(draft['players'])} Cash Tags submitted")
+                print(
+                    f"{len(draft['player_tags'])}/{len(draft['players'])} Cash Tags submitted"
+                )
 
 
 
 class PaymentControlView(discord.ui.View):
-    def __init__(self, channel_id):
+    def __init__(self, channel_id, *, double: bool = False):
         super().__init__(timeout=None)
         self.channel_id = channel_id
+        self.double = double
 
     @discord.ui.button(label="Start Draft Manually", style=discord.ButtonStyle.red)
     async def manual_start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await has_role(interaction.user, ["Draft Admin", "Middleman"]):
-            await interaction.response.send_message("You don’t have permission to start the draft.", ephemeral=True)
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+
+        if not draft:
+            await interaction.response.send_message("Draft not found.", ephemeral=True)
             return
 
-        await interaction.response.send_message("✅ Starting draft manually...", ephemeral=True)
-        await auto_start_draft(interaction.channel)
+        if interaction.user.id != draft.get("middleman_id"):
+            await interaction.response.send_message("Only the selected middle man can start the draft.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("✅ Starting manually...", ephemeral=True)
+        if self.double:
+            # For double or nothing just mark it complete and announce
+            data = load_drafts()
+            draft = data.get(str(self.channel_id), {})
+            if "double" in draft:
+                draft["double"]["state"] = "complete"
+            save_drafts(data)
+            roles = team_role_mentions(interaction.guild, draft)
+            await interaction.channel.send(f"{roles} Double or Nothing started manually!")
+            await send_fullpot_prompt(interaction.channel)
+        else:
+            await auto_start_draft(interaction.guild, interaction.channel, skip_middleman=True)
+
+
+class DoublePromptView(discord.ui.View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+        self.message: discord.Message | None = None
+
+    @discord.ui.button(label="Double", style=discord.ButtonStyle.green)
+    async def double(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if not draft:
+            await interaction.response.send_message("Draft not found.", ephemeral=True)
+            return
+
+        if interaction.user.id not in draft.get("players", []):
+            await interaction.response.send_message("You are not part of this draft.", ephemeral=True)
+            return
+
+        double = draft.setdefault("double", {"state": "voting", "votes": []})
+        if interaction.user.id not in double["votes"]:
+            double["votes"].append(interaction.user.id)
+            # Start countdown when the first vote is cast
+            if len(double["votes"]) == 1:
+                double["expires"] = int(datetime.datetime.utcnow().timestamp()) + 60
+                save_drafts(data)
+                asyncio.create_task(update_double_countdown(interaction.channel, self.message.id))
+            else:
+                save_drafts(data)
+
+        total = len(draft.get("players", []))
+        embed = self.message.embeds[0]
+        if len(double["votes"]) == total:
+            double["state"] = "loser_select"
+            save_drafts(data)
+            disable_all_buttons(self)
+            await self.message.edit(view=self)
+            embed.description = "All players agreed! Select the losing team."
+            await self.message.edit(embed=embed)
+            await interaction.response.defer()
+            await send_loser_selection(interaction.channel)
+        else:
+            embed.description = (
+                f"If the losing team wants a rematch for double the stakes, click **Double**.\n"
+                f"Votes: {len(double['votes'])}/{total}\n"
+                "Otherwise click **Close Draft**."
+            )
+            if len(double["votes"]) == 1:
+                embed.set_footer(text="Time remaining: 60s")
+            await self.message.edit(embed=embed)
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Close Draft", style=discord.ButtonStyle.red)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        disable_all_buttons(self)
+        if self.message:
+            await self.message.edit(view=self)
+        await interaction.response.send_message("Draft closed. Use /enddraft to log results.")
+
+
+class FullPotPromptView(discord.ui.View):
+    """Vote prompt for a full pot rematch after double is done."""
+
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+        self.message: discord.Message | None = None
+
+    @discord.ui.button(label="Full Pot", style=discord.ButtonStyle.green)
+    async def fullpot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if not draft:
+            await interaction.response.send_message("Draft not found.", ephemeral=True)
+            return
+
+        if interaction.user.id not in draft.get("players", []):
+            await interaction.response.send_message("You are not part of this draft.", ephemeral=True)
+            return
+
+        full = draft.setdefault("fullpot", {"state": "voting", "votes": []})
+        if interaction.user.id not in full["votes"]:
+            full["votes"].append(interaction.user.id)
+            if len(full["votes"]) == 1:
+                full["expires"] = int(datetime.datetime.utcnow().timestamp()) + 60
+                save_drafts(data)
+                asyncio.create_task(update_fullpot_countdown(interaction.channel, self.message.id))
+            else:
+                save_drafts(data)
+
+        total = len(draft.get("players", []))
+        embed = self.message.embeds[0]
+        if len(full["votes"]) == total:
+            full["state"] = "collecting"
+            save_drafts(data)
+            disable_all_buttons(self)
+            await self.message.edit(view=self)
+            embed.description = "Collecting full pot payment from the losing team..."
+            await self.message.edit(embed=embed)
+            await interaction.response.defer()
+            # Determine loser from previous double phase
+            loser_team = draft.get("double", {}).get("loser_team")
+            if loser_team == "team1":
+                players = [draft["captains"]["team1"]] + draft.get("team1", [])
+            else:
+                players = [draft["captains"]["team2"]] + draft.get("team2", [])
+            await send_payment_instructions(interaction.channel, players=players, mode="fullpot")
+        else:
+            embed.description = (
+                f"If the losing team wants a rematch for the full pot, click **Full Pot**.\n"
+                f"Votes: {len(full['votes'])}/{total}\n"
+                "Otherwise click **Close Draft**."
+            )
+            if len(full["votes"]) == 1:
+                embed.set_footer(text="Time remaining: 60s")
+            await self.message.edit(embed=embed)
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Went Even", style=discord.ButtonStyle.gray)
+    async def even(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if not draft:
+            await interaction.response.send_message("Draft not found.", ephemeral=True)
+            return
+
+        capt1 = draft.get("captains", {}).get("team1")
+        capt2 = draft.get("captains", {}).get("team2")
+        if interaction.user.id not in (capt1, capt2):
+            await interaction.response.send_message("Only team captains can vote to go even.", ephemeral=True)
+            return
+
+        full = draft.setdefault("fullpot", {"state": "voting"})
+        votes = full.setdefault("even_votes", [])
+        if interaction.user.id in votes:
+            await interaction.response.send_message("You already voted.", ephemeral=True)
+            return
+        votes.append(interaction.user.id)
+        save_drafts(data)
+
+        embed = self.message.embeds[0]
+        if len(votes) < 2:
+            embed.description = "Went even vote recorded. Waiting for the other captain..."
+            await self.message.edit(embed=embed)
+            await interaction.response.send_message("Vote recorded.", ephemeral=True)
+            return
+
+        disable_all_buttons(self)
+        if self.message:
+            await self.message.edit(view=self)
+        full["state"] = "complete"
+        full["even_votes"] = []
+        save_drafts(data)
+        await interaction.channel.send("Captains agreed to go even! Play again!")
+        await interaction.response.defer()
+        await send_double_prompt(interaction.channel)
+
+    @discord.ui.button(label="Close Draft", style=discord.ButtonStyle.red)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        disable_all_buttons(self)
+        if self.message:
+            await self.message.edit(view=self)
+        await interaction.response.send_message("Draft closed. Use /enddraft to log results.")
+
+
+class LoserButtonView(discord.ui.View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+        self.message: discord.Message | None = None
+
+    async def _process_vote(self, interaction: discord.Interaction, team: str):
+        data = load_drafts()
+        draft = data.get(str(self.channel_id))
+        if not draft:
+            await interaction.response.send_message("Draft not found.", ephemeral=True)
+            return
+
+        captains = [draft.get("captains", {}).get("team1"), draft.get("captains", {}).get("team2")]
+        if interaction.user.id not in captains:
+            await interaction.response.send_message("Only team captains can choose the losing team.", ephemeral=True)
+            return
+
+        phase = "fullpot" if draft.get("fullpot", {}).get("state") == "loser_select" else "double"
+        phase_data = draft.setdefault(phase, {})
+        votes = phase_data.setdefault("loser_votes", {})
+        votes[str(interaction.user.id)] = team
+        save_drafts(data)
+
+        embed = self.message.embeds[0]
+
+        if len(votes) < 2:
+            embed.description = "Vote recorded. Waiting for the other captain..."
+            await self.message.edit(embed=embed)
+            await interaction.response.send_message("Vote recorded.", ephemeral=True)
+            return
+
+        values = list(votes.values())
+        if values[0] != values[1]:
+            phase_data["loser_votes"] = {}
+            save_drafts(data)
+            embed.description = "❌ Captains selected different teams. Please agree on the loser."
+            await self.message.edit(embed=embed)
+            await interaction.response.send_message("Votes differed.", ephemeral=True)
+            return
+
+        # Both captains agree
+        phase_data["state"] = "collecting"
+        phase_data["loser_team"] = values[0]
+        phase_data["loser_votes"] = {}
+        save_drafts(data)
+
+        if values[0] == "team1":
+            players = [draft["captains"]["team1"]] + draft.get("team1", [])
+        else:
+            players = [draft["captains"]["team2"]] + draft.get("team2", [])
+
+        if phase == "fullpot":
+            embed.description = "Collecting full pot payment from the losing team..."
+        else:
+            embed.description = "Collecting double payment from the losing team..."
+        await self._disable_buttons()
+        await self.message.edit(embed=embed)
+        await interaction.response.defer()
+        mode = "fullpot" if phase == "fullpot" else "double"
+        await send_payment_instructions(interaction.channel, players=players, mode=mode)
+
+    async def _disable_buttons(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+    @discord.ui.button(label="Team 1", style=discord.ButtonStyle.blurple)
+    async def team1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_vote(interaction, "team1")
+
+    @discord.ui.button(label="Team 2", style=discord.ButtonStyle.red)
+    async def team2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._process_vote(interaction, "team2")
+
+
+async def send_double_prompt(channel):
+    data = load_drafts()
+    draft = data.get(str(channel.id))
+    if not draft:
+        return
+
+    draft["double"] = {"state": "voting", "votes": []}
+    save_drafts(data)
+
+    embed = discord.Embed(
+        title="Double or Nothing?",
+        description=(
+            "If the losing team wants a rematch for double the stakes, click **Double**.\n"
+            "Otherwise click **Close Draft**."
+        ),
+        color=discord.Color.purple(),
+    )
+    view = DoublePromptView(channel.id)
+    msg = await channel.send(embed=embed, view=view)
+    view.message = msg
+
+    double = draft.setdefault("double", {})
+    double["message_id"] = msg.id
+    save_drafts(data)
+
+
+
+async def update_double_countdown(channel: discord.TextChannel, message_id: int):
+    while True:
+        await asyncio.sleep(5)
+        data = load_drafts()
+        draft = data.get(str(channel.id), {})
+        double = draft.get("double", {})
+        if double.get("message_id") != message_id or double.get("state") != "voting":
+            return
+
+        expires = double.get("expires", int(datetime.datetime.utcnow().timestamp()))
+        remaining = expires - int(datetime.datetime.utcnow().timestamp())
+        if remaining <= 0:
+            try:
+                msg = await channel.fetch_message(message_id)
+            except Exception:
+                return
+
+            embed = msg.embeds[0]
+            embed.description = (
+                "If the losing team wants a rematch for double the stakes, click **Double**.\n"
+                "Otherwise click **Close Draft**."
+            )
+            embed.set_footer(text="")
+            await msg.edit(embed=embed)
+
+            double.update({"state": "voting", "votes": []})
+            double.pop("expires", None)
+            save_drafts(data)
+            return
+        else:
+            try:
+                msg = await channel.fetch_message(message_id)
+            except Exception:
+                return
+            embed = msg.embeds[0]
+            embed.set_footer(text=f"Time remaining: {remaining}s")
+            await msg.edit(embed=embed)
+
+
+async def send_fullpot_prompt(channel):
+    data = load_drafts()
+    draft = data.get(str(channel.id))
+    if not draft:
+        return
+
+    draft["fullpot"] = {"state": "voting", "votes": []}
+    save_drafts(data)
+
+    c1 = draft.get("captains", {}).get("team1")
+    c2 = draft.get("captains", {}).get("team2")
+    cap_mentions = f"<@{c1}> <@{c2}>" if c1 and c2 else "Captains"
+
+    embed = discord.Embed(
+        title="Full Pot?",
+        description=(
+            "If the losing team wants a rematch for the entire pot, click **Full Pot**.\n"
+            f"{cap_mentions} can also click **Went Even** to restart.\n"
+            "Otherwise click **Close Draft**."
+        ),
+        color=discord.Color.dark_gold(),
+    )
+    view = FullPotPromptView(channel.id)
+    msg = await channel.send(embed=embed, view=view)
+    view.message = msg
+
+    full = draft.setdefault("fullpot", {})
+    full["message_id"] = msg.id
+    save_drafts(data)
+
+
+async def update_fullpot_countdown(channel: discord.TextChannel, message_id: int):
+    while True:
+        await asyncio.sleep(5)
+        data = load_drafts()
+        draft = data.get(str(channel.id), {})
+        full = draft.get("fullpot", {})
+        if full.get("message_id") != message_id or full.get("state") != "voting":
+            return
+
+        expires = full.get("expires", int(datetime.datetime.utcnow().timestamp()))
+        remaining = expires - int(datetime.datetime.utcnow().timestamp())
+        if remaining <= 0:
+            try:
+                msg = await channel.fetch_message(message_id)
+            except Exception:
+                return
+
+            embed = msg.embeds[0]
+            embed.description = (
+                "If the losing team wants a rematch for the entire pot, click **Full Pot**.\n"
+                "Otherwise click **Close Draft**."
+            )
+            embed.set_footer(text="")
+            await msg.edit(embed=embed)
+
+            full.update({"state": "voting", "votes": []})
+            full.pop("expires", None)
+            save_drafts(data)
+            return
+        else:
+            try:
+                msg = await channel.fetch_message(message_id)
+            except Exception:
+                return
+            embed = msg.embeds[0]
+            embed.set_footer(text=f"Time remaining: {remaining}s")
+            await msg.edit(embed=embed)
+
+
+async def send_loser_selection(channel):
+    data = load_drafts()
+    draft = data.get(str(channel.id))
+    if not draft:
+        return
+
+    t1_members = [draft["captains"]["team1"]] + draft.get("team1", [])
+    t2_members = [draft["captains"]["team2"]] + draft.get("team2", [])
+
+    def names(ids):
+        members = [channel.guild.get_member(uid) for uid in ids]
+        return ", ".join(m.display_name for m in members if m)
+
+    c1 = draft.get("captains", {}).get("team1")
+    c2 = draft.get("captains", {}).get("team2")
+    cap_mentions = f"<@{c1}> <@{c2}>" if c1 and c2 else "Captains"
+
+    desc = (
+        f"{cap_mentions}, choose the losing team below. Only captains can vote.\n\n"
+        f"Team 1: {names(t1_members)}\nTeam 2: {names(t2_members)}"
+    )
+
+    embed = discord.Embed(
+        title="Who lost the match?",
+        description=desc,
+        color=discord.Color.orange(),
+    )
+    view = LoserButtonView(channel.id)
+    msg = await channel.send(embed=embed, view=view)
+    view.message = msg
+
+    phase = None
+    if draft.get("fullpot", {}).get("state") == "loser_select":
+        phase = "fullpot"
+    else:
+        phase = "double"
+
+    draft.setdefault(phase, {})["loser_message_id"] = msg.id
+    save_drafts(data)
 
 
 
@@ -348,37 +838,38 @@ async def begin_cashapp_collection(guild, channel):
     if not draft:
         return
 
+    middleman = f"<@{draft.get('middleman_id')}>" if draft.get('middleman_id') else "Middleman"
+    player_mentions = " ".join(f"<@{uid}>" for uid in draft.get("players", []))
+
     embed = discord.Embed(
-        title="💵 Submit Your Cash App Tag",
+        title="💵 Payment Username Collection",
         description=(
-            "Click the button below to submit your Cash App tag. "
-            "Once everyone sends payment, the draft will start automatically.\n\n"
-            "If someone doesn’t send their payment, the **middleman** can manually start the draft."
+            f"{middleman} will hold the pot.\n"
+            f"{player_mentions}\n"
+            "Click below and enter your **Cash App USERNAME** (not $tag)."
         ),
-        color=discord.Color.green()
+        color=discord.Color.green(),
     )
-    
+
+    # Show an image explaining username vs tag
+    info_embed = discord.Embed(title="Cash App Username vs Tag")
+    image_path = Path(__file__).parent / "cashapp_example.png"
+    if image_path.exists():
+        file = discord.File(str(image_path), filename="cashapp_example.png")
+        info_embed.set_image(url="attachment://cashapp_example.png")
+        info_msg = await channel.send(embed=info_embed, file=file)
+    else:
+        info_embed.description = "cashapp_example.png not found"
+        info_msg = await channel.send(embed=info_embed)
+
+    draft["cashapp_info_msg_id"] = info_msg.id
+    save_drafts(data)
+
     view = CashAppSubmitView(channel_id=channel.id)
     manual_view = ManualStartView(channel_id=channel.id)
 
     await channel.send(embed=embed, view=view)
     await channel.send(view=manual_view)
-
-    for uid in draft["players"]:
-        member = guild.get_member(uid)
-        if member:
-            try:
-                view = discord.ui.View()
-                button = discord.ui.Button(label="Submit Cash App Tag", style=discord.ButtonStyle.primary)
-
-                async def callback(interaction: discord.Interaction, user_id=uid, channel_id=channel.id):
-                    await interaction.response.send_modal(PlayerCashTagForm(user_id, channel_id))
-
-                button.callback = callback
-                view.add_item(button)
-                await member.send("Please submit your Cash App tag:", view=view)
-            except:
-                print(f"Could not DM user {uid}")
 
 async def send_middleman_selection(channel):
     data = load_drafts()
@@ -386,42 +877,84 @@ async def send_middleman_selection(channel):
     if not draft:
         return
 
-    role_id = draft.get("middleman_role_id")
-    if not role_id:
-        return
-
     embed = discord.Embed(
-        title="✅ Middle Man Selected: <#{}>".format(channel.id),
-        description="Click the button below if you're the Middleman.\nYou'll be prompted to enter your Cash App tag.",
+        title="⏳ Waiting for Middle Man",
+        description="Click the button below if you're the Middleman.\nYou'll be prompted to enter your Cash App **tag**.",
         color=discord.Color.orange()
     )
-    view = MiddleManButton(channel.id, role_id)
-    await channel.send(embed=embed, view=view)
+    view = MiddleManButton(channel.id)
+    msg = await channel.send(embed=embed, view=view)
+    draft["middleman_select_msg_id"] = msg.id
+    save_drafts(data)
 
 
-async def send_payment_instructions(channel):
+async def send_payment_instructions(channel, players=None, *, mode: str = "initial"):
     data = load_drafts()
     draft = data.get(str(channel.id))
     if not draft:
         return
 
+    # Delete the Cash App info image once collection is done
+    info_id = draft.pop("cashapp_info_msg_id", None)
+    if info_id:
+        try:
+            msg = await channel.fetch_message(info_id)
+            await msg.delete()
+        except Exception:
+            pass
+        save_drafts(data)
+
+    if players is None:
+        players = draft.get("players", [])
+
     entry = draft.get("entry_amount", 0)
-    middleman_tag = draft.get("middleman_cashapp", "$unknown")
-    total = entry * len(draft["players"])
+    if mode == "double":
+        entry *= 1
+    elif mode == "fullpot":
+        entry *= 2
+    draft["collection_amount"] = entry
+    draft["collection_mode"] = mode
+    middleman_tag = draft.get("middleman_cash_tag", "$unknown")
+    total = entry * len(players)
+
+    # Generate a unique 3-letter note for this draft
+    note = ''.join(random.choice(string.ascii_uppercase) for _ in range(3))
+    draft["payment_note"] = note
+    save_drafts(data)
+
+    pending_payments[str(channel.id)] = {
+        draft["player_tags"].get(str(uid)): uid
+        for uid in players
+        if str(uid) in draft.get("player_tags", {})
+    }
+    payments_received[str(channel.id)] = {uid: 0.0 for uid in players}
+
+    title_map = {
+        "initial": "💰 Payment Instructions",
+        "double": "💰 Double or Nothing Payment",
+        "fullpot": "💰 Full Pot Payment",
+    }
+    title = title_map.get(mode, "💰 Payment Instructions")
 
     embed = discord.Embed(
-        title="💰 Payment Instructions",
-        description=f"Please send your entry fee to the middleman before the match begins.",
+        title=title,
+        description=(
+            f"Send your entry fee to the middleman now and include the note `{note}`.\n"
+            "Payments without the correct note will not be detected."
+        ),
         color=discord.Color.gold()
     )
-    embed.add_field(name="📲 Middleman's Cash App", value=middleman_tag, inline=False)
+    embed.add_field(name="📲 Middleman's Cash App Tag", value=middleman_tag, inline=False)
     embed.add_field(name="💵 Amount to Send", value=f"${entry}", inline=False)
-    embed.add_field(name="📦 Total Expected", value=f"${total} total from {len(draft['players'])} players", inline=False)
+    embed.add_field(name="📦 Total Expected", value=f"${total} total from {len(players)} players", inline=False)
+    embed.add_field(name="🔒 Required Note", value=f"`{note}`", inline=False)
     embed.set_footer(text="Once all payments are confirmed, the draft will begin.")
 
+    player_mentions = " ".join(f"<@{uid}>" for uid in players)
+
     # Manual Start Button
-    view = PaymentControlView(channel.id)
-    await channel.send(embed=embed, view=view)
+    view = PaymentControlView(channel.id, double=(mode=="double"))
+    await channel.send(content=player_mentions, embed=embed, view=view)
 
 
 async def send_pick_options(channel):
@@ -468,55 +1001,6 @@ class GoToDraftButton(discord.ui.View):
 
 
 
-class MiddleManButton(discord.ui.View):
-    def __init__(self, channel_id, role_id):
-        super().__init__(timeout=None)
-        self.channel_id = str(channel_id)
-        self.role_id = role_id
-        self.middleman = None
-
-    @discord.ui.button(label="✅ I'm the Middle Man", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.role_id not in [role.id for role in interaction.user.roles]:
-            await interaction.response.send_message("❌ Only a Middle Man can click this.", ephemeral=True)
-            return
-
-        self.middleman = interaction.user
-        await interaction.channel.set_permissions(self.middleman, send_messages=True)
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content=f"✅ Middle Man Selected: {interaction.user.mention}", view=self)
-        await interaction.response.send_message("Thank you! Now send proof of payments.", ephemeral=True)
-
-        # Proceed with the draft start here
-        await send_payment_confirmation(interaction.channel, interaction.user)
-
-async def send_payment_confirmation(channel, middleman):
-    embed = discord.Embed(
-        title="💸 Send Payments",
-        description=f"All participants must now send their payments to {middleman.mention}.\n\nOnce all payments are confirmed, the Middle Man should confirm below.",
-        color=discord.Color.gold()
-    )
-    view = ConfirmPaymentButton(middleman.id)
-    await channel.send(embed=embed, view=view)
-
-
-class ConfirmPaymentButton(discord.ui.View):
-    def __init__(self, middleman_id):
-        super().__init__(timeout=None)
-        self.middleman_id = middleman_id
-
-    @discord.ui.button(label="✅ Confirm All Payments Received", style=discord.ButtonStyle.primary)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.middleman_id:
-            await interaction.response.send_message("❌ Only the selected Middle Man can confirm this.", ephemeral=True)
-            return
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content="✅ All payments received. Starting draft...", view=self)
-        await send_actual_draft_start(interaction.channel)
-        await send_pick_options(interaction.channel)
 
     
 class DraftQueueView(discord.ui.View):
@@ -605,14 +1089,19 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
         self.channel_id = channel_id
 
         self.cash_tag = discord.ui.TextInput(
-            label="Your Cash App Tag (without $)",
-            placeholder="e.g. johndoe123",
+            label="Cash App Tag (include $)",
+            placeholder="$example",
             required=True
         )
         self.add_item(self.cash_tag)
 
     async def on_submit(self, interaction: discord.Interaction):
         submitted_tag = self.cash_tag.value.strip()
+        if len(submitted_tag) <= 3:
+            await interaction.response.send_message(
+                "❌ Cash App tag must be longer than 3 characters.", ephemeral=True
+            )
+            return
         data = load_drafts()
         draft = data.get(str(self.channel_id), {})
         draft["middleman_cash_tag"] = submitted_tag
@@ -622,41 +1111,33 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
             f"✅ Your Cash App tag `{submitted_tag}` has been saved.", ephemeral=True
         )
 
-        # 🔔 Notify the channel
         channel = interaction.guild.get_channel(self.channel_id)
-        if not channel:
-            return
+        if channel:
+            # Disable the middleman selection button now that it's confirmed
+            try:
+                data = load_drafts()
+                draft = data.get(str(self.channel_id), {})
+                msg_id = draft.get("middleman_select_msg_id")
+                if msg_id:
+                    msg = await channel.fetch_message(msg_id)
+                    view = MiddleManButton(self.channel_id)
+                    disable_all_buttons(view)
+                    await msg.edit(content=f"✅ Middleman: {interaction.user.mention}", view=view)
+            except Exception as e:
+                print(f"Error disabling middleman button: {e}")
 
-        amount = draft.get("entry_amount", 0)
-        cash_tag_display = f"${submitted_tag}"
-
-        embed = discord.Embed(
-            title="💵 Payment Phase",
-            description=(
-                f"Please send **${amount}** to the middleman at `{cash_tag_display}`.\n\n"
-                "Each player must submit payment to continue."
-            ),
-            color=discord.Color.gold()
-        )
-        embed.set_footer(text="Use Cash App and make sure to send the correct amount.")
-
-        view = ManualStartView(channel_id=self.channel_id)
-        await channel.send(embed=embed, view=view)
+            await begin_cashapp_collection(interaction.guild, channel)
 
 
 
 
 @tree.command(name="createdraft", description="Create a new draft")
 @app_commands.describe(
-    draft_type="Is this a friendly or wager draft?",
-    entry_amount="Amount each player pays (only for wager drafts)",
     team_size="Choose 3v3 or 4v4",
+    is_money_draft="Require Cash App payment?",
+    entry_fee="Dollar amount each player must pay",
     snake_draft="Enable snake draft"
 )
-@app_commands.choices(draft_type=[
-    app_commands.Choice(name="Friendly", value="friendly"),
-    app_commands.Choice(name="Wager", value="wager")
-])
 @app_commands.choices(team_size=[
     app_commands.Choice(name="3v3", value="3v3"),
     app_commands.Choice(name="4v4", value="4v4"),
@@ -666,8 +1147,8 @@ class MiddlemanCashTagModal(discord.ui.Modal, title="Enter Your Cash App Tag"):
 async def createdraft(
     interaction: discord.Interaction,
     team_size: app_commands.Choice[str],
-    draft_type: app_commands.Choice[str],
-    entry_amount: int = 0,
+    is_money_draft: bool = False,
+    entry_fee: app_commands.Range[int, 0, None] = 0,
     snake_draft: bool = True,
 ):
     team_count = int(team_size.name[0])
@@ -676,13 +1157,11 @@ async def createdraft(
     now = int(datetime.datetime.now().timestamp())      # For Discord timestamp formatting
     now = int(datetime.datetime.now().timestamp())
 
-    # Save wager/friendly type and entry amount
-# Save wager/friendly type and entry amount
     draft_data = {
         "team_size": team_size.value,
         "snake_draft": snake_draft,
-        "draft_type": draft_type.value,
-        "entry_amount": entry_amount if draft_type.value == "wager" else 0,
+        "is_money_draft": is_money_draft,
+        "entry_amount": entry_fee,
         "date": now,
         "players": [],
         "team1": [],
@@ -692,7 +1171,7 @@ async def createdraft(
         "team_roles": {},
         "available": [],
         "pick_turn": "team1"
-}
+    }
 
 
 
@@ -736,6 +1215,8 @@ async def createdraft(
     embed.add_field(name="📅 Date:", value=f"<t:{now}:F>", inline=False)
     embed.add_field(name="🎙️ Host:", value=interaction.user.mention, inline=False)
     embed.add_field(name="🐍 Snake Draft:", value="Yes" if snake_draft else "No", inline=False)
+    if is_money_draft and entry_fee > 0:
+        embed.add_field(name="💵 Entry Fee", value=f"${entry_fee}", inline=False)
     embed.set_footer(text=f"Queue: 0/{max_players} • Made by blur.exe")
 
     view = DraftQueueView(channel.id, max_players)
@@ -1004,7 +1485,7 @@ async def enddraft(interaction: discord.Interaction, winning_team: app_commands.
     await interaction.channel.delete()
 
 
-async def auto_start_draft(guild, channel):
+async def auto_start_draft(guild, channel, skip_middleman: bool = False):
     data = load_drafts()
     draft = data[str(channel.id)]
 
@@ -1021,17 +1502,20 @@ async def auto_start_draft(guild, channel):
     draft["pick_turn"] = "team1"
     save_drafts(data)
 
+    # Disable queue join/leave buttons now that the draft is starting
+    await disable_queue_buttons(channel)
+
     c1 = await guild.fetch_member(captains[0])
     c2 = await guild.fetch_member(captains[1])
     snake = draft["snake_draft"]
 
-    if draft.get("draft_type") == "friendly":
-        await send_actual_draft_start(channel)
-        await assign_team_roles(guild, channel, draft)
-        await send_pick_options(channel)
-        await dm_players_draft_started(channel)
-    elif draft.get("draft_type") == "wager":
+    if draft.get("is_money_draft") and not skip_middleman:
         await send_middleman_selection(channel)
+        return
+
+    await send_actual_draft_start(channel)
+    await send_pick_options(channel)
+    await dm_players_draft_started(channel)
 
 
 
@@ -1191,6 +1675,9 @@ async def finalize_draft_teams(channel):
     await move_members(draft["team1"] + [draft["captains"]["team1"]], team1_vc)
     await move_members(draft["team2"] + [draft["captains"]["team2"]], team2_vc)
 
+    if draft.get("is_money_draft"):
+        await send_double_prompt(channel)
+
 async def move_all_in_voice_channels(guild, vc_ids, target_channel_id):
     target_channel = guild.get_channel(target_channel_id)
     if not target_channel:
@@ -1213,9 +1700,6 @@ from email.header import decode_header
 import time
 import threading
 
-# Global payment trackers
-pending_payments = {}  # {channel_id: {cash_tag: user_id}}
-confirmed_payments = {}  # {channel_id: set(user_ids)}
 
 def check_cashapp_emails():
     while True:
@@ -1253,25 +1737,75 @@ def check_cashapp_emails():
 
                         print(f"📩 New email: {subject}")
 
-                        # Check each pending payment for matching cash tag
-                        for channel_id, tag_map in pending_payments.items():
-                            for tag, user_id in tag_map.items():
-                                if tag.lower() in subject.lower():
-                                    confirmed = confirmed_payments.setdefault(channel_id, set())
-                                    if user_id in confirmed:
-                                        continue
+                        drafts_snapshot = load_drafts()
 
-                                    confirmed.add(user_id)
+                        def norm(txt: str) -> str:
+                            return re.sub(r"[^a-z0-9]", "", txt.lower())
+
+                        sender_match = re.search(r"^(.*?) sent you", subject, re.IGNORECASE)
+                        sender = sender_match.group(1).strip() if sender_match else ""
+                        sender_norm = norm(sender)
+
+                        note_match = re.search(r"for\s+(\w{3})", subject, re.IGNORECASE)
+                        subject_note = note_match.group(1) if note_match else ""
+                        subject_note_norm = norm(subject_note)
+                        amt_match = re.search(r"\$(\d+(?:\.\d{1,2})?)", subject)
+                        amount_val = float(amt_match.group(1)) if amt_match else 0.0
+
+                        for channel_id, tag_map in pending_payments.items():
+                            note = drafts_snapshot.get(str(channel_id), {}).get("payment_note", "")
+                            note_norm = norm(note)
+
+                            if note_norm and note_norm != subject_note_norm:
+                                continue
+
+                            for tag, user_id in tag_map.items():
+                                tag_norm = norm(tag)
+
+                                if sender_norm == tag_norm:
+                                    payments = payments_received.setdefault(channel_id, {})
+                                    new_total = payments.get(user_id, 0.0) + amount_val
+                                    payments[user_id] = new_total
 
                                     channel = bot.get_channel(int(channel_id))
                                     if channel:
-                                        awaitable = channel.send(f"✅ <@{user_id}> sent payment!")
+                                        awaitable = channel.send(
+                                            f"💸 <@{user_id}> sent ${amount_val:.2f}! Total: ${new_total:.2f}"
+                                        )
                                         asyncio.run_coroutine_threadsafe(awaitable, bot.loop)
 
-                                    if len(confirmed) == len(tag_map):
-                                        if channel:
-                                            awaitable = auto_start_draft(channel.guild, channel)
-                                            asyncio.run_coroutine_threadsafe(awaitable, bot.loop)
+                                    draft_info = drafts_snapshot.get(str(channel_id), {})
+                                    entry_amt = draft_info.get("collection_amount", draft_info.get("entry_amount", 0))
+                                    all_paid = all(
+                                        amt >= entry_amt
+                                        for uid, amt in payments.items()
+                                        if uid in tag_map.values()
+                                    )
+
+                                    if all_paid and channel:
+                                        current = drafts_snapshot.get(str(channel_id), {})
+                                        double_state = current.get("double", {}).get("state")
+                                        full_state = current.get("fullpot", {}).get("state")
+                                        if double_state == "collecting":
+                                            roles = team_role_mentions(channel.guild, current)
+                                            awaitable = channel.send(f"{roles} Double payment received! Play again!")
+                                            data = load_drafts()
+                                            cur = data.get(str(channel_id), {})
+                                            if "double" in cur:
+                                                cur["double"]["state"] = "complete"
+                                            save_drafts(data)
+                                            asyncio.run_coroutine_threadsafe(send_fullpot_prompt(channel), bot.loop)
+                                        elif full_state == "collecting":
+                                            roles = team_role_mentions(channel.guild, current)
+                                            awaitable = channel.send(f"{roles} Full pot payment received! Play again!")
+                                            data = load_drafts()
+                                            cur = data.get(str(channel_id), {})
+                                            if "fullpot" in cur:
+                                                cur["fullpot"]["state"] = "complete"
+                                            save_drafts(data)
+                                        else:
+                                            awaitable = auto_start_draft(channel.guild, channel, skip_middleman=True)
+                                        asyncio.run_coroutine_threadsafe(awaitable, bot.loop)
 
             mail.logout()
 
@@ -1290,4 +1824,4 @@ async def on_ready():
     await tree.sync()
     print(f"✅ Logged in as {bot.user.name}")
 
-bot.run("MTM3NzA3MjE4Njk2MzAwNTQ0MA.GCPWMK.pSCzixxkoDWig9VoGq4pVkZTyZYF0oCoSJ1mRQ")
+bot.run(BOT_TOKEN)
