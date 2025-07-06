@@ -916,4 +916,4 @@ async def on_ready():
     await tree.sync()
     print(f"✅ Logged in as {bot.user.name}")
 
-bot.run("MTM3NzA3MjE4Njk2MzAwNTQ0MA.GNg83W.ifo0uDW64_ljx6jN1GDUO9slBdMTJToGkohLa0")
+bot.run(os.getenv("BOT_TOKEN"))
